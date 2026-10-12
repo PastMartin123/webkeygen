@@ -19,6 +19,9 @@
     position: relative; width: 381px; height: 476px; background: #000;
     /* not clipped: a combo box drop-down list is a popup in Win32 too */
     color: #c0c0c0; overflow: visible;
+    /* scaled down on small screens (phones) so nothing is cut off - the
+       factor is set by fitWindow() in ui.js */
+    transform-origin: center center;
     font: 11px/13px "MS Sans Serif", "Microsoft Sans Serif", Tahoma, "Segoe UI", sans-serif;
   }
 
@@ -92,7 +95,10 @@
                   entries = 82 px, so the 11 entry product list scrolls with
                   the classic scrollbar below - exactly like the original
                   dialog, which gives the combo 67 DLU of height. */
-               max-height: 82px; overflow-y: auto; }
+               max-height: 82px; overflow-y: auto;
+               /* slides open / rolls back up instead of popping in (the height
+                  is set by slideDown()/slideUp() in ui.js) */
+               height: 0; transition: height 130ms ease-out; }
   .combolist.open { display: block; }
   .comboitem { height: 13px; line-height: 13px; padding: 0 3px; white-space: pre;
                color: var(--app-text); cursor: default; }
@@ -547,8 +553,8 @@ var KeygenDialog = (function () {
  * cannot produce a code that any software would accept - it exists so the
  * page's interface (CID parsing, error codes, output box) can be exercised.
  */
- //start_my
- (function (root, factory) {
+
+(function (root, factory) {
 	if (typeof module === 'object' && module.exports) {
 		module.exports = factory();          // Node
 	} else {
@@ -1185,6 +1191,20 @@ var KeygenDialog = (function () {
   win.style.width = D.WIN.w + "px";
   win.style.height = D.WIN.h + "px";
 
+  /* Fit the fixed-size window into small viewports (phones).  Without this the
+     381px wide window overflows the screen and its right edge - where the close
+     box lives - is clipped.  It is a plain CSS transform, so the layout and the
+     drop-down placement below keep working in the window's own pixels. */
+  var winScale = 1;
+  function fitWindow() {
+    winScale = Math.min(1, (window.innerWidth || D.WIN.w) / D.WIN.w,
+                           (window.innerHeight || D.WIN.h) / D.WIN.h);
+    win.style.transform = winScale < 1 ? "scale(" + winScale + ")" : "";
+  }
+  fitWindow();
+  window.addEventListener("resize", fitWindow);
+  window.addEventListener("orientationchange", fitWindow);
+
   /* the 3D area is created first so the controls paint over it */
   var canvas = document.createElement("canvas");
   canvas.id = "screen";
@@ -1211,8 +1231,22 @@ var KeygenDialog = (function () {
 
   function closeCombos(except) {
     Object.keys(combos).forEach(function (k) {
-      if (k !== except) combos[k].list.classList.remove("open");
+      if (k !== except) slideUp(combos[k].list);
     });
+  }
+
+  /* the drop-down slides down, and rolls back up when it closes */
+  function slideDown(list, h) {
+    list.classList.add("open");
+    list.style.height = "0px";
+    if (typeof list.offsetHeight === "number") void list.offsetHeight;  // reflow
+    list.style.height = h + "px";
+  }
+  function slideUp(list) {
+    if (!list.classList.contains("open")) return;
+    list.style.height = "0px";
+    clearTimeout(list._slideT);
+    list._slideT = setTimeout(function () { list.classList.remove("open"); }, 140);
   }
 
   function comboSelect(kind, index) {
@@ -1227,24 +1261,27 @@ var KeygenDialog = (function () {
   function comboOpen(kind, open) {
     var c = combos[kind];
     closeCombos(open ? kind : null);
-    if (!open) { c.list.classList.remove("open"); return; }
+    if (!open) { slideUp(c.list); return; }
     /* like Win32: below the field, with the height the dialog template gives
        the combo (six 13px entries = 82px, so longer lists scroll).  It only
-       flips above when a short viewport leaves no room below. */
-    var wr = win.getBoundingClientRect();
-    var viewH = window.innerHeight || wr.height;
+       flips above when a short viewport leaves no room below.
+       The viewport is converted into the window's own pixels so the mobile
+       fit-scale does not disturb the calculation. */
+    var sx = winScale || 1;
+    var viewH = (window.innerHeight || 900) / sx;
+    var winTop = Math.max(0, (viewH - D.WIN.h) / 2);
     var listH = parseFloat(c.field.dataset.listH) || c.items.length * 13 + 4;
     var fieldTop = parseFloat(c.field.dataset.y) || 0;
     var fieldH = parseFloat(c.field.dataset.h) || 21;
     var baseTop = parseFloat(c.list.dataset.baseTop) || (fieldTop + fieldH);
     var cap = Math.min(listH, 82);
-    var roomBelow = viewH - (wr.top + baseTop) - 4;
-    var roomAbove = (wr.top + fieldTop) - 4;
+    var roomBelow = viewH - (winTop + baseTop) - 4;
+    var roomAbove = (winTop + fieldTop) - 4;
     var below = roomBelow >= cap || roomBelow >= roomAbove;
     var h = Math.min(cap, Math.max(13, below ? roomBelow : roomAbove));
     c.list.style.maxHeight = h + "px";
     c.list.style.top = (below ? baseTop : fieldTop - h) + "px";
-    c.list.classList.add("open");
+    slideDown(c.list, h);
     /* scroll the current entry into view, like a real combo box */
     var sel = c.items[c.index];
     if (sel && typeof sel.offsetTop === "number") {
