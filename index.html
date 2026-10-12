@@ -560,114 +560,628 @@ var KeygenDialog = (function () {
  * cannot produce a code that any software would accept - it exists so the
  * page's interface (CID parsing, error codes, output box) can be exercised.
  */
-var KeygenStub = (function () {
-  "use strict";
+(function (root, factory) {
+	if (typeof module === 'object' && module.exports) {
+		module.exports = factory();          // Node
+	} else {
+		root.KeygenStub = factory();             // 浏览器全局变量
+	}
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+	'use strict';
 
-  var DEVICES = [
-    { id: 1, name: "C51" },
-    { id: 2, name: "C251" },
-    { id: 3, name: "C166" },
-    { id: 4, name: "ARM" }
-  ];
+	/* ==================================================================
+	 * 基础字符域
+	 *
+	 * 36 进制用 '0'-'9' 'A'-'Z'，但 'O' 与 '0' 混同，所以实际可用符号只有
+	 * 35 个: 0-9 A-N P-Z。加密过程里的偏移量全部取模 35，而不是 36。
+	 * 为了和 C 版逐位一致，内部一律用「字符码」(number) 而非字符串。
+	 * ================================================================== */
 
-  var LIC_TYPES = [
-    { id: 1, name: "Cortex-M0/M0+" },
-    { id: 2, name: "Cortex-M0/M0+ 128K" },
-    { id: 3, name: "Cortex-M0/M0+ 256K" },
-    { id: 4, name: "Macro Assembler Kit" },
-    { id: 5, name: "Compiler/Assembler Kit" },
-    { id: 6, name: "Developers Kit" },
-    { id: 7, name: "Debugger" },
-    { id: 8, name: "Hitex Extensions" },
-    { id: 9, name: "Infineon Extensions" },
-    { id: 10, name: "Essential/Standard Cortex-M only" },
-    { id: 11, name: "MDK Plus" },
-    { id: 12, name: "Prof. Developers Kit/Plus" },
-    { id: 13, name: "Limited (64K)" },
-    { id: 14, name: "Basic (256K)/Community" },
-    { id: 15, name: "RL/Real-Time OS" },
-    { id: 16, name: "ARTX Real-Time OS" },
-    { id: 17, name: "Professional Cortex-M only(DS5)" },
-    { id: 18, name: "Professional" }
-  ];
+	var CH_DASH = 45;   /* '-' */
+	var CH_ZERO = 48;   /* '0' */
+	var CH_O    = 79;   /* 'O' */
 
-  /* the page shows one entry per license type, mapped onto those ids */
-  var TYPE_BY_NAME = {
-    "Prof. Developers Kit (Plus)": 12,
-    "Developers Kit": 6,
-    "Macro Assembler Kit": 4,
-    "Compiler/Assembler Kit": 5,
-    "Real-Time OS": 15,
-    "Debugger": 7,
-    "Hitex Extensions": 8,
-    "Infineon Extensions": 9,
-    "Standard Cortex-M only": 10,
-    "Professional Cortex-M only": 17,
-    "Professional": 18
-  };
-  var DEV_BY_NAME = { "C51": 1, "C251": 2, "C166": 3, "ARM": 4 };
+	/**
+	 * 数值 -> 字符码 (0..35)
+	 * 'O' 会被映射成 '0'
+	 */
+	function rdx36tochar(n) {
+		n &= 0xff;
+		if (n >= 10) { n += 7; }
+		n += 48;
+		if (n === CH_O) { n = CH_ZERO; }
+		return n;
+	}
 
-  var ALPHABET = "0123456789ABCDEFGHIJKLMNPQRSTUVWXYZ";   // 35 symbols, no 'O'
+	/**
+	 * 字符码 -> 数值 (0..35)
+	 * 'O' 会被当作 '0'
+	 */
+	function chartordx36(c) {
+		c &= 0xff;
+		if (c === CH_O) { c = CH_ZERO; }
+		c -= 48;
+		if (c >= 10) { c -= 7; }
+		return c;
+	}
 
-  /* Math.imul is ES6; older in-app WebViews (e.g. QQ/X5) may not have it */
-  var imul = Math.imul || function (a, b) {
-    var ah = (a >>> 16) & 0xFFFF, al = a & 0xFFFF;
-    var bh = (b >>> 16) & 0xFFFF, bl = b & 0xFFFF;
-    return (al * bl + (((ah * bl + al * bh) << 16) >>> 0)) | 0;
-  };
+	/**
+	 * 字符码 <-> 偏移量 (0..34) 的双向转换。
+	 *
+	 * 入参 < 35 视作偏移量并返回字符码；否则视作字符码并返回偏移量。
+	 * 注意: 偏移量 24 会映射到 'P'（跳过 'O'），这正是 C 版里
+	 * "if (c >= 79) ++c;" 那一行的作用。
+	 *
+	 * 与 C 版的唯一差异: C 版对字符 'O' 写的是 "return '0';"，返回的是
+	 * ASCII 48 而不是数值 0（一个真实存在的笔误）。本移植按注释与 Keil 的
+	 * 实际语义返回 0，并且 normalizeCid() 会先把 'O' 归一成 '0'，所以这条
+	 * 分支在正常流程里根本不会被触发。
+	 */
+	function coff(c) {
+		c &= 0xff;
+		if (c < 35) {
+			c += (c >= 10) ? 55 : 48;
+			if (c >= 79) { ++c; }
+		} else {
+			if (c === CH_O) { return 0; }
+			if (c > 79) { --c; }
+			c -= 48;
+			if (c >= 10) { c -= 7; }
+		}
+		return c;
+	}
 
-  function Rng(tick) { this.s = (tick >>> 0) || 1; }
-  Rng.prototype.next = function () {
-    this.s = (imul(this.s, 1664525) + 1013904223) >>> 0;
-    return this.s;
-  };
-  Rng.prototype.sym = function () { return ALPHABET.charAt(this.next() % 35); };
+	/* ==================================================================
+	 * 随机数: Park-Miller MINSTD
+	 * ================================================================== */
 
-  /* "ABCDEFGHIJ" -> "ABCDE-FGHIJ"; keeps only [0-9A-Z] */
-  function normalizeCid(cidText) {
-    var s = String(cidText == null ? "" : cidText).toUpperCase().replace(/[^0-9A-Z]/g, "");
-    return s;
-  }
-  function formatCid(s) {
-    return s.length === 10 ? s.slice(0, 5) + "-" + s.slice(5) : s;
-  }
-  function group5(s) {
-    return [s.slice(0, 5), s.slice(5, 10), s.slice(10, 15), s.slice(15, 20)].join("-");
-  }
-  function byId(list, id) {
-    for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
-    return null;
-  }
+	var rndState = 0;
 
-  /* params: cidText (CID as shown by the tool, "ABCDE-FGHIJ"), devId (DEVICES),
-     typeId (LIC_TYPES), tick (any uint32 seed, like the original GetTickCount).
-     returns { ok, error, lic, cid, fields, decrypted } */
-  function genLic(cidText, devId, typeId, tick) {
-    var cid = normalizeCid(cidText);
-    var out = { ok: false, error: 0, lic: "", cid: cid, fields: null, decrypted: "" };
-    if (cid.length !== 10) { out.error = 1; return out; }        // bad CID
-    var dev = byId(DEVICES, devId);
-    if (!dev) { out.error = 2; return out; }                     // unknown device
-    var type = byId(LIC_TYPES, typeId);
-    if (!type) { out.error = 3; return out; }                    // unknown type
+	/**
+	 * seed 非 0 时重新播种；返回下一个随机数。
+	 * 对应 C 版的 random()
+	 */
+	function random(seed) {
+		if (seed) { rndState = (seed >>> 0) & 0x3FFFFFFF; }
+		if (!rndState) { rndState = 1; }
+		rndState = (rndState * 48271) % 2147483647;
+		return rndState;
+	}
 
-    var rng = new Rng(tick), body = "";
-    for (var i = 0; i < 20; i++) body += rng.sym();
+	/* ==================================================================
+	 * 加密 / 解密
+	 *
+	 * 不是标准密码，而是一套「链式偏移替换」：每个字符先加上当前偏移再查表
+	 * 输出，然后偏移自身也随字符推进。所以字符的处理顺序本身就是密钥的一
+	 * 部分，LIC 的表和 CID 的表不一样。
+	 * ================================================================== */
 
-    out.ok = true;
-    out.lic = group5(body);
-    out.cid = formatCid(cid);
-    out.fields = { devId: dev.id, devName: dev.name,
-                   typeId: type.id, typeName: type.name,
-                   tick: tick >>> 0 };
-    out.decrypted = cid;                                         // demo value
-    return out;
-  }
+	var START_SC_CID = 0x07;   /* CID 加解密的起始字符下标 */
+	var START_SC_LIC = 0x0e;   /* LIC 加解密的起始字符下标 */
 
-  return { DEVICES: DEVICES, LIC_TYPES: LIC_TYPES,
-           DEV_BY_NAME: DEV_BY_NAME, TYPE_BY_NAME: TYPE_BY_NAME,
-           genLic: genLic, normalizeCid: normalizeCid };
-})();
+	var CKSUM_LIC_HSC = 0x18;  /* LIC 校验和高位 */
+	var CKSUM_LIC_LSC = 0x1f;  /* LIC 校验和低位 */
+
+	/* CID 的加解密下标表，到 START_SC_CID 结束 */
+	var cds_tb = [
+		0x09, 0x01, 0x03, 0x02, 0x04, 0x06, 0x08, 0x0a,
+		START_SC_CID
+	];
+
+	/* LIC 的加解密下标表，到 START_SC_LIC 结束 */
+	var lcs_tb = [
+		0x16, 0x15, 0x14, 0x13, 0x12, 0x10, 0x0f, 0x0d,
+		0x0c, 0x0a, 0x09, 0x08, 0x07, 0x06, 0x04, 0x03,
+		0x02, 0x01, 0x00, 0x1f, 0x18, 0x1a, 0x1e, 0x20,
+		0x19, 0x1b, 0x21, 0x1c, 0x22,
+		START_SC_LIC
+	];
+
+	/* 计算起始字符时参与散列的 LIC 下标 */
+	var s_tb = [
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0c, 0x0d, 0x0f, 0x10, 0x12, 0x13,
+		0x14, 0x15, 0x16
+	];
+
+	/**
+	 * 加密一个字符
+	 * @param {number} c   字符码 ('0'-'9' / 'A'-'Z')
+	 * @param {object} st  链式偏移状态 { off }
+	 * @returns {number}   密文字符码
+	 */
+	function encrypt_ch(c, st) {
+		var off = coff(c);
+		off = (off + st.off) % 35;
+		if (off < 32) { off ^= 26; }
+		st.off = (off + 3) % 35;
+		return coff(off);
+	}
+
+	/**
+	 * 解密一个字符，encrypt_ch 的逆运算
+	 */
+	function decrypt_ch(c, st) {
+		var off = coff(c);
+		var t = off;
+		if (off < 32) { off ^= 26; }
+		off = (off < st.off) ? (off + 35 - st.off) : (off - st.off);
+		st.off = (t + 3) % 35;
+		return coff(off);
+	}
+
+	/**
+	 * 加密 CID（原地）
+	 * @param {number[]} cid 11 个字符码
+	 */
+	function encrypt_cid(cid) {
+		var st = { off: coff(cid[START_SC_CID]) };
+		for (var i = 0; i < cds_tb.length; i++) {
+			var p = cds_tb[i];
+			if (p === START_SC_CID) { break; }
+			cid[p] = encrypt_ch(cid[p], st);
+		}
+	}
+
+	/**
+	 * 解密 CID（原地）
+	 * @param {number[]} cid 11 个字符码
+	 */
+	function decrypt_cid(cid) {
+		var st = { off: coff(cid[START_SC_CID]) };
+		for (var i = 0; i < cds_tb.length; i++) {
+			var p = cds_tb[i];
+			if (p === START_SC_CID) { break; }
+			cid[p] = decrypt_ch(cid[p], st);
+		}
+	}
+
+	/**
+	 * 计算 LIC 的起始字符（LIC[14]）
+	 *
+	 * 把 19 个字段位置的偏移量逐位「打散」进 32 位寄存器，每步左移一位，
+	 * 溢出的那一位若为 1 就异或 0x00400007（CRC 风格的 LFSR），最后折叠
+	 * 取模 35。
+	 */
+	function start_lic(lic) {
+		var t0 = 0;
+		for (var i = 0; i < s_tb.length; i++) {
+			var off = coff(lic[s_tb[i]]);
+			var t2 = 0;
+			if (off & 0x01) { t2 |= 0x00000001; }
+			if (off & 0x02) { t2 |= 0x00000008; }
+			if (off & 0x04) { t2 |= 0x00000020; }
+			if (off & 0x08) { t2 |= 0x00000100; }
+			if (off & 0x10) { t2 |= 0x00000400; }
+			if (off & 0x20) { t2 |= 0x00002000; }
+			if (off & 0x40) { t2 |= 0x00010000; }
+			if (off & 0x80) { t2 |= 0x00040000; }
+			var t1 = t0 & 0x80000000;
+			t0 = (t2 ^ ((t0 << 1) >>> 0)) >>> 0;
+			if (t1) { t0 = (t0 ^ 0x00400007) >>> 0; }
+		}
+		var h5 = (t0 | (t0 >>> 5)) >>> 0;
+		var h10 = t0 >>> 10;
+		t0 = (h10 ^ h5) >>> 0;
+		return coff(t0 % 35);
+	}
+
+	/**
+	 * LIC 校验和: 除分隔符与 [24] [31] 外所有字符偏移量之和，模 1225 (35*35)
+	 */
+	function cksum_lic(lic) {
+		var sum = 0;
+		for (var i = 0; i < 35; i++) {
+			if (i === 5 || i === 11 || i === 17 || i === 23 ||
+				i === 24 || i === 29 || i === 31) {
+				continue;
+			}
+			sum += coff(lic[i]);
+		}
+		return sum % 1225;
+	}
+
+	/**
+	 * 加密 LIC（原地）
+	 *
+	 * 1) 算出起始字符放进 [14]
+	 * 2) 以明文计算校验和，放进 [24] [31]
+	 * 3) 以 [14] 为初始偏移，按 lcs_tb 的顺序加密全体
+	 */
+	function encrypt_lic(lic) {
+		lic[START_SC_LIC] = start_lic(lic);
+
+		var sum = cksum_lic(lic);
+		lic[CKSUM_LIC_HSC] = coff(Math.floor(sum / 35));
+		lic[CKSUM_LIC_LSC] = coff(sum % 35);
+
+		var st = { off: coff(lic[START_SC_LIC]) };
+		for (var i = 0; i < lcs_tb.length; i++) {
+			var p = lcs_tb[i];
+			if (p === START_SC_LIC) { break; }
+			lic[p] = encrypt_ch(lic[p], st);
+		}
+	}
+
+	/**
+	 * 解密 LIC（原地），并校验
+	 * @returns {number} 0 正常；-1 校验和错；-2 起始字符错
+	 */
+	function decrypt_lic(lic) {
+		var st = { off: coff(lic[START_SC_LIC]) };
+		for (var i = 0; i < lcs_tb.length; i++) {
+			var p = lcs_tb[i];
+			if (p === START_SC_LIC) { break; }
+			lic[p] = decrypt_ch(lic[p], st);
+		}
+
+		var sum = coff(lic[CKSUM_LIC_HSC]) * 35 + coff(lic[CKSUM_LIC_LSC]);
+		if (sum !== cksum_lic(lic)) { return -1; }
+		if (start_lic(lic) !== lic[START_SC_LIC]) { return -2; }
+		return 0;
+	}
+
+	/* ==================================================================
+	 * CID 校验与归一化
+	 * ================================================================== */
+
+	/**
+	 * 把用户输入整理成 Keil 能接受的 CID 形式:
+	 * 去掉空白、转大写、'O' 归一为 '0'
+	 */
+	function normalizeCid(text) {
+		return String(text == null ? '' : text)
+			.replace(/\s+/g, '')
+			.toUpperCase()
+			.replace(/O/g, '0');
+	}
+
+	/**
+	 * 校验 CID 格式，错误码与 C 版一致
+	 * @returns {number} 0 正常；-2 长度不对；-3 有非法字符
+	 */
+	function mcid_check(cid) {
+		if (typeof cid === 'string') { cid = strToCodes(cid); }
+		if (cid.length !== 11) { return -2; }
+		for (var i = 0; i < 11; i++) {
+			if (i === 5) {
+				if (cid[i] !== CH_DASH) { return -3; }
+				continue;
+			}
+			if (cid[i] < 48) { return -3; }                       /* < '0' */
+			if (cid[i] > 57 && cid[i] < 65) { return -3; }        /* 9 ~ A */
+			if (cid[i] > 90) { return -3; }                       /* > 'Z' */
+		}
+		return 0;
+	}
+
+	/* ==================================================================
+	 * LIC 组装
+	 * ================================================================== */
+
+	/* 目标器件 (lic_dev_id) */
+	var DEVICES = [
+		{ id: 1, name: 'C51' },
+		{ id: 2, name: 'C251' },
+		{ id: 3, name: 'C166' },
+		{ id: 4, name: 'ARM' }
+	];
+
+	/* 授权类型 (lic_type_id)，名称取自原程序的下拉框文案 */
+	var LIC_TYPES = [
+		{ id: 1,  name: 'Cortex-M0/M0+' },
+		{ id: 2,  name: 'Cortex-M0/M0+ 128K' },
+		{ id: 3,  name: 'Cortex-M0/M0+ 256K' },
+		{ id: 4,  name: 'Macro Assembler Kit' },
+		{ id: 5,  name: 'Compiler/Assembler Kit' },
+		{ id: 6,  name: 'Developers Kit' },
+		{ id: 7,  name: 'Debugger' },
+		{ id: 8,  name: 'Hitex Extensions' },
+		{ id: 9,  name: 'Infineon Extensions' },
+		{ id: 10, name: 'Essential/Standard Cortex-M only' },
+		{ id: 11, name: 'MDK Plus' },
+		{ id: 12, name: 'Prof. Developers Kit/Plus' },
+		{ id: 13, name: 'Limited (64K)' },
+		{ id: 14, name: 'Basic (256K)/Community' },
+		{ id: 15, name: 'RL/Real-Time OS' },
+		{ id: 16, name: 'ARTX Real-Time OS' },
+		{ id: 17, name: 'Professional Cortex-M only(DS5)' },
+		{ id: 18, name: 'Professional' }
+	];
+
+	/**
+	 * 授权类型 -> LIC[0] 的字母
+	 * 完全照抄 C 版的 switch，注意 id 18 (Professional) 走 default 得 'T'
+	 */
+	function typeLetter(id) {
+		switch (id) {
+		case 1:  return '1';
+		case 2:  return '2';
+		case 3:  return '3';
+		case 4:  return 'A';
+		case 5:  return 'C';
+		case 6:  return 'D';
+		case 7:  return 'G';
+		case 8:  return 'H';
+		case 9:  return 'I';
+		case 10: return 'J';
+		case 11: /* MDK_PLUS */
+		case 12: /* PK_PROF_DEVELOPERS_KIT */
+			return 'K';
+		case 13: return 'N';
+		case 14: return 'Q';
+		case 15: /* RL */
+		case 16: /* ARTX_REAL_TIME_OS */
+			return 'R';
+		case 17: return 'S';
+		default: return 'T';
+		}
+	}
+
+	function strToCodes(s) {
+		var out = [];
+		for (var i = 0; i < s.length; i++) { out.push(s.charCodeAt(i) & 0xff); }
+		return out;
+	}
+
+	function codesToStr(a) {
+		var s = '';
+		for (var i = 0; i < a.length; i++) {
+			if (!a[i]) { break; }              /* 0 当作结束符 */
+			s += String.fromCharCode(a[i]);
+		}
+		return s;
+	}
+
+	/**
+	 * 按 C 的 strtol(buf, 0, 36) 语义解析: 从 start 开始，
+	 * 遇到不属于 [0-9A-Za-z] 的字符就停（'-' 会停下）
+	 */
+	function strtol36(codes, start) {
+		var v = 0;
+		for (var i = start; i < codes.length; i++) {
+			var c = codes[i];
+			var d;
+			if (c >= 48 && c <= 57) { d = c - 48; }
+			else if (c >= 65 && c <= 90) { d = c - 55; }
+			else if (c >= 97 && c <= 122) { d = c - 87; }
+			else { break; }
+			v = v * 36 + d;
+		}
+		return v;
+	}
+
+	/* ------------------------------------------------------------------
+	 * 以下每一步都对应 C 版 slicx.c 中的一个函数，顺序不可更改
+	 * ------------------------------------------------------------------ */
+
+	/** 填空串、填分隔符、填可选的随机位 */
+	function lic_rand(lic, tick) {
+		random(tick >>> 0);
+		for (var i = 0; i < 35; i++) {
+			if (i === 5 || i === 11 || i === 17 || i === 23 || i === 29) {
+				lic[i] = CH_DASH;
+				continue;
+			}
+			lic[i] = CH_ZERO;
+		}
+		lic[35] = 0;
+
+		/* 这几个位置先占位，后面会被真正的值覆盖 */
+		lic[14] = 49;   /* '1' 起始字符 */
+		lic[24] = 49;   /* '1' 校验和高位 */
+		lic[31] = 49;   /* '1' 校验和低位 */
+		lic[34] = 49;   /* '1' */
+
+		/* 4 个随机字符，参与 sum3 与校验和 */
+		for (var j = 7; j < 11; j++) {
+			lic[j] = rdx36tochar(random(0) % 36);
+		}
+	}
+
+	/** 授权类型: [0] 类型字母, [4] 'C' = 永久, [13] '0' = 不限厂商 */
+	function lic_type(lic, id) {
+		lic[4] = 67;    /* 'C'：永久授权，限制最少 */
+		lic[0] = typeLetter(id).charCodeAt(0);
+		lic[13] = CH_ZERO;
+	}
+
+	/** 与注册表相关的位；lic[4]=='C' 时取固定值 */
+	function lic_regist(lic) {
+		if (lic[4] === 67) {           /* 'C' */
+			lic[16] = 90;              /* 'Z' */
+			lic[25] = CH_ZERO;
+			lic[26] = CH_ZERO;
+			lic[27] = CH_ZERO;
+			lic[28] = CH_ZERO;
+		}
+	}
+
+	/** 目标器件 */
+	function lic_dev(lic, id) {
+		switch (id) {
+		case 1: lic[1] = 49; break;    /* '1' C51  */
+		case 2: lic[1] = 50; break;    /* '2' C251 */
+		case 3: lic[1] = 54; break;    /* '6' C166 */
+		default: lic[1] = 65; break;   /* 'A' 其余(含 ARM) */
+		}
+	}
+
+	/** 支持截止日期: 'D' + 'Z' = 2032 年 12 月 */
+	function lic_support(lic) {
+		lic[2] = 68;   /* 'D' 十二月 */
+		lic[3] = 90;   /* 'Z' = 2032 (coff('Z') + 1998) */
+	}
+
+	/** 校验位 1 -> [12] */
+	function lic_sum1(lic) {
+		var t = strtol36(lic, 12);
+		var r = 0;
+		if (t) {
+			r = strtol36(lic, 0);
+			t = (t * 7) >>> 0;
+			r = Math.floor(r / t) >>> 0;
+			r = (r + 0x41c64e6d) >>> 0;
+			r = r % 36;
+		}
+		lic[12] = rdx36tochar(r);
+	}
+
+	/** 校验位 2 -> [15]，注意这里混用了字符码本身 */
+	function lic_sum2(lic) {
+		var r = 0;
+		r += lic[0] ^ lic[1];
+		r += lic[1] ^ lic[12];
+		r += 4 * lic[0];
+		lic[15] = rdx36tochar(r % 36);
+	}
+
+	/** 校验位 3 -> [6]，滚动散列 */
+	function lic_sum3(lic) {
+		var m_tb = [
+			0x02, 0x03, 0x04, 0x05, 0x07, 0x05, 0x0d, 0x03,
+			0x0b, 0x00
+		];
+		var r = chartordx36(lic[0]);
+		for (var i = 1; i < 17; i++) {
+			if ((i > 4) && (i < 12)) { continue; }
+			var s = (i > 4) ? (i - 8) : (i - 1);
+			var t = m_tb[s] * r;
+			t ^= chartordx36(lic[i]);
+			r += t & 0x3f;
+		}
+		r = rdx36tochar(r % 36);
+		r = chartordx36(r);
+		r += 7  * chartordx36(lic[10]);
+		r += 3  * chartordx36(lic[9]);
+		r += 5  * chartordx36(lic[8]);
+		r += 11 * chartordx36(lic[7]);
+		lic[6] = rdx36tochar(r % 36);
+	}
+
+	/** 把 (解密后的) CID 的第 1,2,3,4,6 位搬到 [18..22]，完成机器绑定 */
+	function lic_mcid(lic, cid) {
+		decrypt_cid(cid);
+		lic[18] = cid[1];
+		lic[19] = cid[2];
+		lic[20] = cid[3];
+		lic[21] = cid[4];
+		lic[22] = cid[6];
+	}
+
+	/* ==================================================================
+	 * 对外接口
+	 * ================================================================== */
+
+	/**
+	 * 由 CID 生成 LIC（对应 C 版的 lic_make）
+	 *
+	 * @param {string}  cidText  Keil 里显示的 CID，形如 "ABCDE-FGHIJ"
+	 * @param {number}  devId    目标器件 id，见 DEVICES
+	 * @param {number}  typeId   授权类型 id，见 LIC_TYPES
+	 * @param {number}  tick     随机种子（对应 GetTickCount()），可为任意 uint32
+	 * @returns {{ok:boolean, error:number, lic:string, cid:string,
+	 *            fields:object|null, decrypted:string}}
+	 */
+	function lic_make(cidText, devId, typeId, tick) {
+		var cidStr = normalizeCid(cidText);
+		var cid = strToCodes(cidStr);
+
+		var err = mcid_check(cid);
+		if (err) {
+			return { ok: false, error: err, lic: '', cid: cidStr,
+				fields: null, decrypted: '' };
+		}
+
+		var lic = new Array(36).fill(0);
+
+		lic_rand(lic, tick >>> 0);
+		lic_type(lic, typeId);
+		lic_regist(lic);
+		lic_dev(lic, devId);
+		lic_support(lic);
+		lic_sum1(lic);
+		lic_sum2(lic);
+		lic_sum3(lic);
+		lic_mcid(lic, cid);
+		encrypt_lic(lic);
+
+		var outCid = codesToStr(cid);
+
+		/* 再解一遍做自检，同时给出字段解析 */
+		var plain = lic.slice(0, 35);
+		var verify = decrypt_lic(plain);
+
+		return {
+			ok: true,
+			error: 0,
+			lic: codesToStr(lic),
+			cid: outCid,
+			decrypted: codesToStr(plain),
+			verify: verify,
+			fields: verify === 0 ? describeLic(plain, typeId) : null
+		};
+	}
+
+	/**
+	 * 把明文 LIC 逐字段解释出来，数字下标即文档里的 [xx]
+	 */
+	function describeLic(lic, typeId) {
+		var ch = function (i) { return String.fromCharCode(lic[i]); };
+		var letter = ch(0);
+		var typeName = '未知';
+		for (var i = 0; i < LIC_TYPES.length; i++) {
+			if (LIC_TYPES[i].id === typeId) {
+				typeName = LIC_TYPES[i].name;
+				break;
+			}
+		}
+		return {
+			type: letter + '  ' + typeName,
+			device: ch(1),
+			support: ch(2) + ch(3),
+			permanent: ch(4) === 'C' ? '是 (C)' : '否 (' + ch(4) + ')',
+			sum3: ch(6),
+			random: ch(7) + ch(8) + ch(9) + ch(10),
+			sum1: ch(12),
+			vendor: ch(13) === '0' ? '不限厂商 (0)' : ch(13),
+			start: ch(14),
+			sum2: ch(15),
+			registry: ch(16),
+			cid: ch(18) + ch(19) + ch(20) + ch(21) + ch(22),
+			cksum: ch(24) + ch(31)
+		};
+	}
+
+	/**
+	 * 解密一个 LIC 字符串（自检 / 排查用）
+	 * @returns {{error:number, plain:string}}
+	 */
+	function lic_decode(licText) {
+		var s = String(licText == null ? '' : licText).trim();
+		if (s.length !== 35) { return { error: -3, plain: '' }; }
+		var lic = strToCodes(s);
+		var err = decrypt_lic(lic);
+		return { error: err, plain: codesToStr(lic) };
+	}
+
+	return {
+		lic_make: lic_make,
+		lic_decode: lic_decode,
+		mcid_check: mcid_check,
+		normalizeCid: normalizeCid,
+		encrypt_cid: function (s) {
+			var a = strToCodes(s); encrypt_cid(a); return codesToStr(a);
+		},
+		decrypt_cid: function (s) {
+			var a = strToCodes(s); decrypt_cid(a); return codesToStr(a);
+		},
+		DEVICES: DEVICES,
+		LIC_TYPES: LIC_TYPES,
+		typeLetter: typeLetter
+	};
+});
+
 </script>
 <script>/*
  * Page wiring: the dialog chrome (dialog.js), the 3D animation (effects.js,
@@ -872,9 +1386,9 @@ var KeygenStub = (function () {
 
   /* ---- Generate / Open Request -> demo code (random, see keygen.js) ------ */
   function generate() {
-    var dev = KeygenStub.DEV_BY_NAME[els.licenseText.textContent];
-    var type = KeygenStub.TYPE_BY_NAME[els.targetText.textContent];
-    var res = KeygenStub.genLic(els.cid.value, dev, type, Date.now() >>> 0);
+    var dev = KeygenStub.DEVICES[els.licenseText.textContent];
+    var type = KeygenStub.LIC_TYPES[els.targetText.textContent];
+    var res = KeygenStub.lic_make(els.cid.value, dev, type, Date.now() >>> 0);
     els.output.value = res.ok ? res.lic : "Invalid Computer ID!!";
   }
   ["btn1001", "btn1002"].forEach(function (id) {
